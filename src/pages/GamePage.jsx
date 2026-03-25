@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Chessboard } from 'react-chessboard';
 import { START_FEN, buildJoinPayload, createMovePayload, getGamePlayers, getLiveClocks } from '../lib/game';
@@ -16,11 +16,10 @@ export default function GamePage() {
   const [error, setError] = useState('');
   const [now, setNow] = useState(Date.now());
   const timeoutHandledRef = useRef(false);
+  const previousTurnRef = useRef(null);
+  const notificationPermissionRequestedRef = useRef(false);
 
-  const loadGame = async () => {
-    setLoading(true);
-    setError('');
-
+  const fetchGame = useCallback(async () => {
     const { data, error: fetchError } = await supabase
       .from('games')
       .select(`
@@ -31,41 +30,107 @@ export default function GamePage() {
       .eq('id', gameId)
       .single();
 
-    if (fetchError) {
-      setError(fetchError.message);
-    } else {
-      setGame(data);
-      timeoutHandledRef.current = false;
+    if (fetchError) throw fetchError;
+    return data;
+  }, [gameId]);
+
+  const loadGame = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setLoading(true);
+      setError('');
     }
 
-    setLoading(false);
-  };
+    try {
+      const data = await fetchGame();
+      setGame((current) => {
+        if (!current) return data;
+        if ((data?.updated_at || '') >= (current?.updated_at || '')) return data;
+        return current;
+      });
+      timeoutHandledRef.current = false;
+    } catch (err) {
+      if (!silent) {
+        setError(err.message || 'No fue posible cargar la partida.');
+      }
+    } finally {
+      if (!silent) {
+        setLoading(false);
+      }
+    }
+  }, [fetchGame]);
 
   useEffect(() => {
     loadGame();
-  }, [gameId]);
+  }, [loadGame]);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(interval);
   }, []);
 
+
+  const notifyTurn = useCallback(() => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    if (Notification.permission !== 'granted') return;
+    if (!document.hidden) return;
+
+    const playerTurn = game?.current_turn === 'w' ? 'blancas' : 'negras';
+    const notification = new Notification('Tu turno', {
+      body: `Ya puedes mover. Turno actual: ${playerTurn}.`,
+      tag: `game-turn-${gameId}`,
+      renotify: true,
+    });
+
+    notification.onclick = () => {
+      window.focus();
+      notification.close();
+    };
+  }, [game?.current_turn, gameId]);
+
+  const requestNotificationPermission = useCallback(async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return false;
+    if (Notification.permission === 'granted') return true;
+    if (Notification.permission === 'denied') return false;
+
+    try {
+      const permission = await Notification.requestPermission();
+      return permission === 'granted';
+    } catch {
+      return false;
+    }
+  }, []);
+
   useEffect(() => {
     const channel = supabase
       .channel(`game-${gameId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` }, () => {
-        loadGame();
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${gameId}` }, async () => {
+        await loadGame({ silent: true });
       })
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [gameId]);
+  }, [gameId, loadGame]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      loadGame({ silent: true });
+    }, 1200);
+
+    return () => window.clearInterval(interval);
+  }, [loadGame]);
+
+
+  useEffect(() => {
+    if (!user || notificationPermissionRequestedRef.current) return;
+    notificationPermissionRequestedRef.current = true;
+    requestNotificationPermission().catch(() => {});
+  }, [user, requestNotificationPermission]);
 
   const { myColor, opponentId } = useMemo(
-    () => (game ? getGamePlayers(game, user.id) : { myColor: null, opponentId: null }),
-    [game, user.id]
+    () => (game && user ? getGamePlayers(game, user.id) : { myColor: null, opponentId: null }),
+    [game, user]
   );
 
   const liveClocks = useMemo(() => (game ? getLiveClocks(game, now) : { white: 0, black: 0 }), [game, now]);
@@ -84,9 +149,26 @@ export default function GamePage() {
       : game?.white_profile?.display_name || game?.white_profile?.username
     : null;
 
+  const updateGameAndSync = async (payload, extraFilters = {}) => {
+    setGame((current) => (current ? { ...current, ...payload } : current));
+
+    let query = supabase.from('games').update(payload).eq('id', gameId);
+
+    Object.entries(extraFilters).forEach(([key, value]) => {
+      query = query.eq(key, value);
+    });
+
+    const { error: updateError } = await query;
+    if (updateError) {
+      await loadGame({ silent: true });
+      throw updateError;
+    }
+
+    await loadGame({ silent: true });
+  };
+
   const finishGame = async (payload) => {
-    const { error: updateError } = await supabase.from('games').update(payload).eq('id', gameId);
-    if (updateError) throw updateError;
+    await updateGameAndSync(payload);
   };
 
   const handleJoinGame = async () => {
@@ -94,24 +176,18 @@ export default function GamePage() {
     setError('');
 
     try {
-      if (!game) return;
+      if (!game || !user) return;
       const joinPayload = buildJoinPayload(game, user.id);
+      const nowIso = new Date().toISOString();
 
       const payload = {
         ...joinPayload,
         status: 'active',
-        started_at: new Date().toISOString(),
-        turn_started_at: new Date().toISOString(),
+        started_at: nowIso,
+        turn_started_at: nowIso,
       };
 
-      const { error: updateError } = await supabase
-        .from('games')
-        .update(payload)
-        .eq('id', game.id)
-        .eq('status', 'waiting');
-
-      if (updateError) throw updateError;
-      await loadGame();
+      await updateGameAndSync(payload, { status: 'waiting' });
     } catch (err) {
       setError(err.message || 'No fue posible entrar a la partida.');
     } finally {
@@ -129,7 +205,7 @@ export default function GamePage() {
   };
 
   const handlePieceDrop = async (sourceSquare, targetSquare) => {
-    if (!game || !isMyTurn || actionLoading) return false;
+    if (!game || !user || !isMyTurn || actionLoading) return false;
 
     setActionLoading(true);
     setError('');
@@ -145,13 +221,7 @@ export default function GamePage() {
         user.id
       );
 
-      const { error: updateError } = await supabase
-        .from('games')
-        .update(payload)
-        .eq('id', game.id)
-        .eq('status', 'active');
-
-      if (updateError) throw updateError;
+      await updateGameAndSync(payload, { status: 'active' });
       return true;
     } catch (err) {
       setError(err.message || 'No fue posible registrar el movimiento.');
@@ -182,7 +252,7 @@ export default function GamePage() {
   };
 
   const handleOfferDraw = async () => {
-    if (!game || !myColor) return;
+    if (!game || !myColor || !user) return;
     setActionLoading(true);
     setError('');
 
@@ -220,7 +290,7 @@ export default function GamePage() {
   };
 
   const handleRematch = async () => {
-    if (!game || !opponentName) return;
+    if (!game || !opponentName || !user) return;
     setActionLoading(true);
     setError('');
 
@@ -253,6 +323,37 @@ export default function GamePage() {
     }
   };
 
+
+  useEffect(() => {
+    if (!game || !myColor || game.status !== 'active') return;
+
+    const currentMyTurn =
+      (game.current_turn === 'w' && myColor === 'white') ||
+      (game.current_turn === 'b' && myColor === 'black');
+
+    const previousTurn = previousTurnRef.current;
+
+    if (previousTurn === null) {
+      previousTurnRef.current = game.current_turn;
+      return;
+    }
+
+    const previousWasMine =
+      (previousTurn === 'w' && myColor === 'white') ||
+      (previousTurn === 'b' && myColor === 'black');
+
+    if (!previousWasMine && currentMyTurn) {
+      notifyTurn();
+      if (typeof document !== 'undefined') {
+        document.title = 'Tu turno - ChessBN';
+      }
+    } else if (typeof document !== 'undefined') {
+      document.title = 'ChessBN';
+    }
+
+    previousTurnRef.current = game.current_turn;
+  }, [game, myColor, notifyTurn]);
+
   useEffect(() => {
     if (!game || game.status !== 'active' || timeoutHandledRef.current) return;
 
@@ -276,6 +377,15 @@ export default function GamePage() {
       }).catch((err) => setError(err.message || 'No fue posible cerrar la partida por tiempo.'));
     }
   }, [game, liveClocks.white, liveClocks.black]);
+
+
+  useEffect(() => {
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.title = 'ChessBN';
+      }
+    };
+  }, []);
 
   if (loading) {
     return <div className="card">Cargando partida...</div>;
@@ -396,9 +506,16 @@ export default function GamePage() {
           <button className="button button-secondary" type="button" onClick={handleCopyLink}>
             Copiar enlace
           </button>
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={requestNotificationPermission}
+          >
+            Activar notificaciones
+          </button>
           {game.status === 'active' && myColor ? (
             <>
-              <button className="button button-secondary" type="button" onClick={handleOfferDraw} disabled={actionLoading || game.draw_offer_by === user.id}>
+              <button className="button button-secondary" type="button" onClick={handleOfferDraw} disabled={actionLoading || game.draw_offer_by === user?.id}>
                 Ofrecer tablas
               </button>
               <button className="button button-danger" type="button" onClick={handleResign} disabled={actionLoading}>
@@ -413,7 +530,7 @@ export default function GamePage() {
           ) : null}
         </div>
 
-        {game.draw_offer_by && game.draw_offer_by !== user.id && game.status === 'active' ? (
+        {game.draw_offer_by && game.draw_offer_by !== user?.id && game.status === 'active' ? (
           <div className="notice-box top-space">
             <strong>Tu rival ofreció tablas</strong>
             <div className="inline-actions top-space">
