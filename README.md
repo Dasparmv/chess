@@ -141,3 +141,10 @@ npm run dev
 npm run build
 npm run preview
 ```
+
+
+## 8) Foto de perfil
+
+- El SQL ya crea el bucket público `avatars` y sus políticas.
+- Si ya tenías el proyecto creado antes de esta versión, vuelve a ejecutar `supabase/schema.sql` o al menos el bloque final de Storage para avatares.
+- La foto se sube desde el panel principal y se muestra en el podio, ranking y barra superior.

@@ -26,7 +26,7 @@ export default function LoginPage() {
   return (
     <div className="auth-shell">
       <form className="auth-card" onSubmit={handleSubmit}>
-        <h1>Iniciar sesión</h1>
+        <h1>Ajedrez BN</h1>
 
         <label>
           Email

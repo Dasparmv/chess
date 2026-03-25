@@ -24,8 +24,8 @@ export default function GamePage() {
       .from('games')
       .select(`
         *,
-        white_profile:profiles!games_white_player_id_fkey(id, username, display_name),
-        black_profile:profiles!games_black_player_id_fkey(id, username, display_name)
+        white_profile:profiles!games_white_player_id_fkey(id, username, display_name, avatar_url),
+        black_profile:profiles!games_black_player_id_fkey(id, username, display_name, avatar_url)
       `)
       .eq('id', gameId)
       .single();
@@ -68,36 +68,29 @@ export default function GamePage() {
     return () => window.clearInterval(interval);
   }, []);
 
-
   const notifyTurn = useCallback(() => {
     if (typeof window === 'undefined' || !('Notification' in window)) return;
-    if (Notification.permission !== 'granted') return;
-    if (!document.hidden) return;
+    if (Notification.permission !== 'granted' || !document.hidden) return;
 
-    const playerTurn = game?.current_turn === 'w' ? 'blancas' : 'negras';
-    const notification = new Notification('Tu turno', {
-      body: `Ya puedes mover. Turno actual: ${playerTurn}.`,
+    const note = new Notification('Tu turno', {
+      body: 'Ya puedes mover en la partida.',
       tag: `game-turn-${gameId}`,
       renotify: true,
     });
 
-    notification.onclick = () => {
+    note.onclick = () => {
       window.focus();
-      notification.close();
+      note.close();
     };
-  }, [game?.current_turn, gameId]);
+  }, [gameId]);
 
   const requestNotificationPermission = useCallback(async () => {
     if (typeof window === 'undefined' || !('Notification' in window)) return false;
     if (Notification.permission === 'granted') return true;
     if (Notification.permission === 'denied') return false;
 
-    try {
-      const permission = await Notification.requestPermission();
-      return permission === 'granted';
-    } catch {
-      return false;
-    }
+    const permission = await Notification.requestPermission();
+    return permission === 'granted';
   }, []);
 
   useEffect(() => {
@@ -120,7 +113,6 @@ export default function GamePage() {
 
     return () => window.clearInterval(interval);
   }, [loadGame]);
-
 
   useEffect(() => {
     if (!user || notificationPermissionRequestedRef.current) return;
@@ -148,6 +140,16 @@ export default function GamePage() {
       ? game?.black_profile?.display_name || game?.black_profile?.username
       : game?.white_profile?.display_name || game?.white_profile?.username
     : null;
+
+  const lastMove = Array.isArray(game?.moves_json) && game.moves_json.length ? game.moves_json[game.moves_json.length - 1] : null;
+  const lastMoveIsOpponent =
+    lastMove && myColor ? (lastMove.color === 'w' && myColor === 'black') || (lastMove.color === 'b' && myColor === 'white') : Boolean(lastMove);
+  const highlightedSquares = lastMove && lastMoveIsOpponent
+    ? {
+        [lastMove.from]: { backgroundColor: 'rgba(250, 204, 21, 0.35)' },
+        [lastMove.to]: { backgroundColor: 'rgba(250, 204, 21, 0.55)' },
+      }
+    : {};
 
   const updateGameAndSync = async (payload, extraFilters = {}) => {
     setGame((current) => (current ? { ...current, ...payload } : current));
@@ -323,7 +325,6 @@ export default function GamePage() {
     }
   };
 
-
   useEffect(() => {
     if (!game || !myColor || game.status !== 'active') return;
 
@@ -344,11 +345,9 @@ export default function GamePage() {
 
     if (!previousWasMine && currentMyTurn) {
       notifyTurn();
-      if (typeof document !== 'undefined') {
-        document.title = 'Tu turno - ChessBN';
-      }
+      if (typeof document !== 'undefined') document.title = 'Tu turno - Ajedrez BN';
     } else if (typeof document !== 'undefined') {
-      document.title = 'ChessBN';
+      document.title = 'Ajedrez BN';
     }
 
     previousTurnRef.current = game.current_turn;
@@ -378,13 +377,10 @@ export default function GamePage() {
     }
   }, [game, liveClocks.white, liveClocks.black]);
 
-
-  useEffect(() => {
-    return () => {
-      if (typeof document !== 'undefined') {
-        document.title = 'ChessBN';
-      }
-    };
+  useEffect(() => () => {
+    if (typeof document !== 'undefined') {
+      document.title = 'Ajedrez BN';
+    }
   }, []);
 
   if (loading) {
@@ -434,9 +430,17 @@ export default function GamePage() {
             boardOrientation={myColor || 'white'}
             onPieceDrop={handlePieceDrop}
             arePiecesDraggable={Boolean(isMyTurn)}
+            customSquareStyles={highlightedSquares}
             customBoardStyle={{ borderRadius: '16px', boxShadow: '0 10px 30px rgba(15, 23, 42, 0.18)' }}
           />
         </div>
+
+        {lastMove && lastMoveIsOpponent ? (
+          <div className="notice-box notice-highlight">
+            <strong>Último movimiento del rival</strong>
+            <p className="muted">{lastMove.san} · {lastMove.from} → {lastMove.to}</p>
+          </div>
+        ) : null}
 
         {game.status === 'waiting' && myColor ? (
           <div className="notice-box">
@@ -506,11 +510,7 @@ export default function GamePage() {
           <button className="button button-secondary" type="button" onClick={handleCopyLink}>
             Copiar enlace
           </button>
-          <button
-            className="button button-secondary"
-            type="button"
-            onClick={requestNotificationPermission}
-          >
+          <button className="button button-secondary" type="button" onClick={requestNotificationPermission}>
             Activar notificaciones
           </button>
           {game.status === 'active' && myColor ? (
@@ -553,7 +553,7 @@ export default function GamePage() {
 
         <ol className="moves-list">
           {(Array.isArray(game.moves_json) ? game.moves_json : []).map((move, index) => (
-            <li key={`${move.san}-${index}`}>
+            <li key={`${move.san}-${index}`} className={index === (game.moves_json?.length || 0) - 1 ? 'move-last' : ''}>
               <span>{index + 1}.</span>
               <strong>{move.san}</strong>
               <span className="muted">{move.from} → {move.to}</span>

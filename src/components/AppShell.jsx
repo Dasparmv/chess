@@ -1,5 +1,14 @@
 import { Link, NavLink } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
+import { supabase } from '../lib/supabase';
+import Avatar from './Avatar';
+
+function buildPublicAvatarUrl(path) {
+  if (!path) return '';
+  if (path.startsWith('http://') || path.startsWith('https://')) return path;
+  const { data } = supabase.storage.from('avatars').getPublicUrl(path);
+  return data?.publicUrl || '';
+}
 
 export default function AppShell({ children }) {
   const { profile, logout } = useAuth();
@@ -8,7 +17,7 @@ export default function AppShell({ children }) {
     <div className="app-shell">
       <header className="topbar">
         <Link to="/dashboard" className="brand">
-          Chess Friends
+          Ajedrez BN
         </Link>
 
         <nav className="topbar-nav">
@@ -16,6 +25,7 @@ export default function AppShell({ children }) {
             Inicio
           </NavLink>
           <span className="profile-chip">
+            <Avatar name={profile?.display_name || profile?.username} url={buildPublicAvatarUrl(profile?.avatar_url)} size="sm" />
             {profile?.display_name || profile?.username || 'Jugador'}
           </span>
           <button
