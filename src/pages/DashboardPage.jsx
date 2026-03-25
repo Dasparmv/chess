@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import Avatar from '../components/Avatar';
 import { useAuth } from '../contexts/AuthContext';
@@ -51,9 +51,19 @@ function getWinRate(entry) {
   return `${Math.round((Number(entry?.wins || 0) / total) * 100)}%`;
 }
 
+function withTimeout(promise, message, timeoutMs = 12000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]);
+}
+
 export default function DashboardPage() {
   const { user, profile, refreshProfile } = useAuth();
   const navigate = useNavigate();
+  const mountedRef = useRef(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [stats, setStats] = useState(null);
@@ -83,72 +93,126 @@ export default function DashboardPage() {
     ? Number(form.customIncrementSeconds)
     : Number(selectedPreset.incrementSeconds);
 
-  const loadDashboard = async () => {
-    setLoading(true);
-    setError('');
+  const loadDashboard = useCallback(async ({ silent = false } = {}) => {
+    if (!user) return;
+    if (!silent) {
+      setLoading(true);
+      setError('');
+    }
 
-    const username = profile?.username;
+    try {
+      const username = profile?.username;
 
-    const [statsResponse, myGamesResponse, rankingResponse, invitesResponse] = await Promise.all([
-      supabase.from('user_stats').select('*').eq('user_id', user.id).maybeSingle(),
-      supabase
-        .from('games')
-        .select(`
-          *,
-          white_profile:profiles!games_white_player_id_fkey(id, username, display_name, avatar_url),
-          black_profile:profiles!games_black_player_id_fkey(id, username, display_name, avatar_url)
-        `)
-        .or(`created_by.eq.${user.id},white_player_id.eq.${user.id},black_player_id.eq.${user.id}`)
-        .order('updated_at', { ascending: false }),
-      supabase
-        .from('user_stats')
-        .select(`
-          *,
-          profile:profiles!user_stats_user_id_fkey(id, username, display_name, avatar_url)
-        `)
-        .order('wins', { ascending: false })
-        .order('draws', { ascending: false })
-        .limit(10),
-      username
-        ? supabase
+      const [statsResponse, myGamesResponse, rankingResponse, invitesResponse] = await Promise.all([
+        withTimeout(supabase.from('user_stats').select('*').eq('user_id', user.id).maybeSingle(), 'Tiempo agotado al cargar estadísticas.'),
+        withTimeout(
+          supabase
             .from('games')
             .select(`
               *,
               white_profile:profiles!games_white_player_id_fkey(id, username, display_name, avatar_url),
               black_profile:profiles!games_black_player_id_fkey(id, username, display_name, avatar_url)
             `)
-            .eq('status', 'waiting')
-            .neq('created_by', user.id)
-            .or(`invited_username.is.null,invited_username.eq.${username}`)
-            .order('created_at', { ascending: false })
-        : Promise.resolve({ data: [], error: null }),
-    ]);
+            .or(`created_by.eq.${user.id},white_player_id.eq.${user.id},black_player_id.eq.${user.id}`)
+            .order('updated_at', { ascending: false }),
+          'Tiempo agotado al cargar partidas.'
+        ),
+        withTimeout(
+          supabase
+            .from('user_stats')
+            .select(`
+              *,
+              profile:profiles!user_stats_user_id_fkey(id, username, display_name, avatar_url)
+            `)
+            .order('wins', { ascending: false })
+            .order('draws', { ascending: false })
+            .limit(10),
+          'Tiempo agotado al cargar ranking.'
+        ),
+        username
+          ? withTimeout(
+              supabase
+                .from('games')
+                .select(`
+                  *,
+                  white_profile:profiles!games_white_player_id_fkey(id, username, display_name, avatar_url),
+                  black_profile:profiles!games_black_player_id_fkey(id, username, display_name, avatar_url)
+                `)
+                .eq('status', 'waiting')
+                .neq('created_by', user.id)
+                .or(`invited_username.is.null,invited_username.eq.${username}`)
+                .order('created_at', { ascending: false }),
+              'Tiempo agotado al cargar invitaciones.'
+            )
+          : Promise.resolve({ data: [], error: null }),
+      ]);
 
-    const responseError =
-      statsResponse.error || myGamesResponse.error || rankingResponse.error || invitesResponse.error;
+      if (!mountedRef.current) return;
 
-    if (responseError) {
-      setError(responseError.message);
-    } else {
-      setStats(statsResponse.data || { wins: 0, losses: 0, draws: 0, total_games: 0 });
-      setMyGames(myGamesResponse.data || []);
-      setRanking((rankingResponse.data || []).map((entry) => ({
-        ...entry,
-        profile: entry.profile
-          ? { ...entry.profile, avatar_url: buildPublicAvatarUrl(entry.profile.avatar_url) }
-          : null,
-      })));
-      setOpenInvites(invitesResponse.data || []);
+      const responseError =
+        statsResponse?.error || myGamesResponse?.error || rankingResponse?.error || invitesResponse?.error;
+
+      if (responseError) {
+        setError(responseError.message || 'No fue posible cargar el panel.');
+      }
+
+      setStats(statsResponse?.data || { wins: 0, losses: 0, draws: 0, total_games: 0 });
+      setMyGames(myGamesResponse?.data || []);
+      setRanking(
+        (rankingResponse?.data || []).map((entry) => ({
+          ...entry,
+          profile: entry.profile
+            ? { ...entry.profile, avatar_url: buildPublicAvatarUrl(entry.profile.avatar_url) }
+            : null,
+        }))
+      );
+      setOpenInvites(invitesResponse?.data || []);
+    } catch (err) {
+      if (mountedRef.current && !silent) {
+        setError(err.message || 'No fue posible cargar el panel.');
+      }
+    } finally {
+      if (mountedRef.current && !silent) {
+        setLoading(false);
+      }
     }
+  }, [user, profile?.username]);
 
-    setLoading(false);
-  };
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (user && profile) {
       loadDashboard();
     }
-  }, [user, profile]);
+  }, [user, profile, loadDashboard]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const refresh = () => {
+      if (document.visibilityState === 'visible') {
+        loadDashboard({ silent: true });
+      }
+    };
+
+    const interval = window.setInterval(() => {
+      loadDashboard({ silent: true });
+    }, 30000);
+
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', refresh);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [user, loadDashboard]);
 
   const handleAvatarUpload = async (event) => {
     const file = event.target.files?.[0];
@@ -172,7 +236,6 @@ export default function DashboardPage() {
 
       if (uploadError) throw uploadError;
 
-      const avatarUrl = buildPublicAvatarUrl(path);
       const { error: updateError } = await supabase
         .from('profiles')
         .update({ avatar_url: path })
@@ -181,7 +244,7 @@ export default function DashboardPage() {
       if (updateError) throw updateError;
 
       await refreshProfile();
-      await loadDashboard();
+      await loadDashboard({ silent: true });
       setAvatarMessage('Foto actualizada.');
     } catch (err) {
       setError(err.message || 'No fue posible actualizar la foto.');
@@ -271,6 +334,9 @@ export default function DashboardPage() {
             <h1>Panel principal</h1>
             <p className="muted">Tu usuario: @{profile?.username}</p>
           </div>
+          <button className="button button-secondary" type="button" onClick={() => loadDashboard()}>
+            Recargar
+          </button>
         </div>
 
         <div className="stats-grid">
@@ -473,6 +539,8 @@ export default function DashboardPage() {
             {creatingGame ? 'Creando...' : 'Crear partida'}
           </button>
         </form>
+
+        {error ? <div className="form-error top-space">{error}</div> : null}
       </section>
 
       <section className="card">
@@ -500,6 +568,35 @@ export default function DashboardPage() {
       <section className="card">
         <div className="section-title-row">
           <div>
+            <h2>Invitaciones disponibles</h2>
+            <p className="muted">Partidas esperando rival.</p>
+          </div>
+        </div>
+
+        <div className="list-stack">
+          {openInvites.length === 0 ? <p className="muted">No hay invitaciones pendientes.</p> : null}
+          {openInvites.map((game) => {
+            const creator = game.created_by === game.white_player_id ? game.white_profile : game.black_profile;
+            return (
+              <div className="list-item" key={game.id}>
+                <div>
+                  <strong>@{creator?.username || 'jugador'}</strong>
+                  <p className="muted small-text">
+                    {game.base_minutes}+{game.increment_seconds} · {game.invited_username ? `Invitación para @${game.invited_username}` : 'Abierta'}
+                  </p>
+                </div>
+                <Link className="button button-secondary" to={`/game/${game.id}`}>
+                  Abrir
+                </Link>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="section-title-row">
+          <div>
             <h2>Ranking</h2>
             <p className="muted">Top de jugadores</p>
           </div>
@@ -518,11 +615,10 @@ export default function DashboardPage() {
                     <p className="muted small-text">{entry.wins} victorias · {entry.draws} tablas</p>
                   </div>
                 </div>
-                <span className="muted">{getWinRate(entry)}</span>
               </div>
             ))
           ) : (
-            <div className="muted">Aún no hay datos.</div>
+            <p className="muted">Todavía no hay ranking.</p>
           )}
         </div>
       </section>
@@ -530,62 +626,29 @@ export default function DashboardPage() {
       <section className="card card-span-2">
         <div className="section-title-row">
           <div>
-            <h2>Invitaciones abiertas</h2>
-            <p className="muted">Partidas esperando rival</p>
+            <h2>Tus partidas</h2>
+            <p className="muted">Activas, pendientes y terminadas.</p>
           </div>
         </div>
 
         <div className="list-stack">
-          {openInvites.length ? (
-            openInvites.map((invite) => (
-              <div className="list-item" key={invite.id}>
+          {activeGames.length === 0 ? <p className="muted">Aún no tienes partidas.</p> : null}
+          {activeGames.map((game) => {
+            const opponent = getOpponent(game, user.id);
+            return (
+              <div className="list-item" key={game.id}>
                 <div>
-                  <strong>{invite.white_profile?.display_name || invite.black_profile?.display_name || 'Partida abierta'}</strong>
+                  <strong>{opponent ? `vs @${opponent.username}` : 'Esperando rival'}</strong>
                   <p className="muted small-text">
-                    {invite.base_minutes}+{invite.increment_seconds} · {invite.invited_username ? `Solo para @${invite.invited_username}` : 'Enlace abierto'}
+                    {game.status === 'waiting' ? 'Esperando que el rival entre' : 'Partida activa'} · {game.base_minutes}+{game.increment_seconds}
                   </p>
                 </div>
-                <Link className="button button-secondary" to={`/game/${invite.id}`}>
-                  Entrar
+                <Link className="button button-secondary" to={`/game/${game.id}`}>
+                  Abrir
                 </Link>
               </div>
-            ))
-          ) : (
-            <div className="muted">No hay invitaciones disponibles ahora.</div>
-          )}
-        </div>
-      </section>
-
-      <section className="card card-span-2">
-        <div className="section-title-row">
-          <div>
-            <h2>Partidas recientes</h2>
-            <p className="muted">Tus partidas activas y terminadas</p>
-          </div>
-        </div>
-
-        <div className="list-stack">
-          {activeGames.concat(finishedGames).length ? (
-            activeGames.concat(finishedGames).slice(0, 12).map((game) => {
-              const opponent = getOpponent(game, user.id);
-              const resultLabel = formatResultLabel(game, user.id);
-              return (
-                <div className="list-item" key={game.id}>
-                  <div>
-                    <strong>{opponent?.display_name || opponent?.username || 'Rival pendiente'}</strong>
-                    <p className="muted small-text">
-                      {game.base_minutes}+{game.increment_seconds} · {resultLabel}
-                    </p>
-                  </div>
-                  <Link to={`/game/${game.id}`} className="button button-secondary">
-                    Abrir
-                  </Link>
-                </div>
-              );
-            })
-          ) : (
-            <div className="muted">Todavía no has jugado ninguna partida.</div>
-          )}
+            );
+          })}
         </div>
       </section>
 
@@ -593,37 +656,57 @@ export default function DashboardPage() {
         <div className="section-title-row">
           <div>
             <h2>Marcador contra rivales</h2>
-            <p className="muted">Historial directo</p>
+            <p className="muted">Balance acumulado por oponente.</p>
           </div>
         </div>
 
         <div className="list-stack">
-          {headToHead.length ? (
-            headToHead.map((entry) => (
-              <div className="list-item" key={entry.opponent.id}>
-                <div className="ranking-player">
-                  <Avatar
-                    name={entry.opponent.display_name || entry.opponent.username}
-                    url={buildPublicAvatarUrl(entry.opponent.avatar_url)}
-                    size="sm"
-                  />
-                  <div>
-                    <strong>{entry.opponent.display_name || entry.opponent.username}</strong>
-                    <p className="muted small-text">
-                      {entry.wins} victorias · {entry.losses} derrotas · {entry.draws} tablas
-                    </p>
-                  </div>
-                </div>
-                <span className="muted">{entry.total} partidas</span>
+          {headToHead.length === 0 ? <p className="muted">Aún no tienes historial contra otros jugadores.</p> : null}
+          {headToHead.map((entry) => (
+            <div className="list-item" key={entry.opponent.id}>
+              <div>
+                <strong>
+                  {entry.opponent.display_name || entry.opponent.username} (@{entry.opponent.username})
+                </strong>
+                <p className="muted small-text">
+                  {entry.wins} victorias · {entry.losses} derrotas · {entry.draws} tablas
+                </p>
               </div>
-            ))
-          ) : (
-            <div className="muted">Completa partidas para ver este marcador.</div>
-          )}
+            </div>
+          ))}
         </div>
       </section>
 
-      {error ? <div className="form-error card-span-2">{error}</div> : null}
+      <section className="card card-span-2">
+        <div className="section-title-row">
+          <div>
+            <h2>Últimos resultados</h2>
+            <p className="muted">Historial reciente.</p>
+          </div>
+        </div>
+
+        <div className="list-stack">
+          {finishedGames.slice(0, 10).map((game) => {
+            const opponent = getOpponent(game, user.id);
+            return (
+              <div className="list-item" key={game.id}>
+                <div>
+                  <strong>
+                    {formatResultLabel(game, user.id)} {opponent ? `vs @${opponent.username}` : ''}
+                  </strong>
+                  <p className="muted small-text">
+                    {game.result || 'finalizada'} · {game.base_minutes}+{game.increment_seconds}
+                  </p>
+                </div>
+                <Link className="button button-secondary" to={`/game/${game.id}`}>
+                  Ver
+                </Link>
+              </div>
+            );
+          })}
+          {finishedGames.length === 0 ? <p className="muted">Todavía no hay resultados terminados.</p> : null}
+        </div>
+      </section>
     </div>
   );
 }

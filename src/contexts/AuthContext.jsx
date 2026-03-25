@@ -3,40 +3,122 @@ import { supabase } from '../lib/supabase';
 
 const AuthContext = createContext(null);
 
+function normalizeUsername(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '')
+    .slice(0, 20);
+}
+
+function buildFallbackProfile(user) {
+  const rawUsername = user?.user_metadata?.username || user?.email?.split('@')[0] || 'jugador';
+  const username = normalizeUsername(rawUsername) || `jugador${String(user?.id || '').replace(/-/g, '').slice(0, 6)}`;
+  const displayName = user?.user_metadata?.display_name || username;
+
+  return {
+    id: user.id,
+    username,
+    display_name: displayName,
+    avatar_url: user?.user_metadata?.avatar_url || null,
+  };
+}
+
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  const loadProfile = async (currentUser) => {
+    if (!currentUser?.id) {
+      setProfile(null);
+      return null;
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', currentUser.id)
+      .maybeSingle();
+
+    if (data) {
+      setProfile(data);
+      return data;
+    }
+
+    const fallbackProfile = buildFallbackProfile(currentUser);
+
+    const { data: createdProfile, error: insertError } = await supabase
+      .from('profiles')
+      .upsert(fallbackProfile, { onConflict: 'id' })
+      .select('*')
+      .maybeSingle();
+
+    if (!insertError && createdProfile) {
+      setProfile(createdProfile);
+      return createdProfile;
+    }
+
+    if (error) {
+      console.warn('No fue posible cargar el perfil:', error.message);
+    }
+    if (insertError) {
+      console.warn('No fue posible crear el perfil automáticamente:', insertError.message);
+    }
+
+    setProfile(fallbackProfile);
+    return fallbackProfile;
+  };
+
   useEffect(() => {
     let mounted = true;
 
     const bootstrap = async () => {
-      const {
-        data: { session: initialSession },
-      } = await supabase.auth.getSession();
+      try {
+        const {
+          data: { session: initialSession },
+        } = await supabase.auth.getSession();
 
-      if (!mounted) return;
+        if (!mounted) return;
 
-      setSession(initialSession);
-      if (initialSession?.user) {
-        await loadProfile(initialSession.user.id);
+        setSession(initialSession);
+
+        if (initialSession?.user) {
+          await loadProfile(initialSession.user);
+        } else {
+          setProfile(null);
+        }
+      } catch (error) {
+        console.warn('No fue posible restaurar la sesión:', error?.message || error);
+      } finally {
+        if (mounted) setLoading(false);
       }
-      setLoading(false);
     };
 
     bootstrap();
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange(async (_event, nextSession) => {
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!mounted) return;
+
       setSession(nextSession);
-      if (nextSession?.user) {
-        await loadProfile(nextSession.user.id);
-      } else {
-        setProfile(null);
-      }
-      setLoading(false);
+
+      window.setTimeout(async () => {
+        if (!mounted) return;
+
+        try {
+          if (nextSession?.user) {
+            await loadProfile(nextSession.user);
+          } else {
+            setProfile(null);
+          }
+        } catch (error) {
+          console.warn('No fue posible actualizar la sesión:', error?.message || error);
+        } finally {
+          if (mounted) setLoading(false);
+        }
+      }, 0);
     });
 
     return () => {
@@ -45,20 +127,8 @@ export function AuthProvider({ children }) {
     };
   }, []);
 
-  const loadProfile = async (userId) => {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', userId)
-      .single();
-
-    if (!error) {
-      setProfile(data);
-    }
-  };
-
   const register = async ({ email, password, username, displayName }) => {
-    const normalizedUsername = username.trim().toLowerCase();
+    const normalizedUsername = normalizeUsername(username);
 
     const { data: existingUser, error: usernameLookupError } = await supabase
       .from('profiles')
@@ -105,8 +175,8 @@ export function AuthProvider({ children }) {
       register,
       logout,
       refreshProfile: async () => {
-        if (session?.user?.id) {
-          await loadProfile(session.user.id);
+        if (session?.user) {
+          await loadProfile(session.user);
         }
       },
     }),
